@@ -44,7 +44,7 @@ Wait for DNS propagation (this can take up to 24-48 hours).
 Download and run the installation script:
 
 ```bash
-wget -O enhanced-setup-server.sh https://raw.githubusercontent.com/yourusername/autodeploy-scripts/main/enhanced-setup-server.sh
+wget -O enhanced-setup-server.sh https://raw.githubusercontent.com/minhminhfreelancer/auto-install-nodejs/main/enhanced-setup-server.sh
 chmod +x enhanced-setup-server.sh
 sudo ./enhanced-setup-server.sh --domain yourdomain.com
 ```
@@ -237,7 +237,7 @@ tenmiền.com     A     IP_MÁY_CHỦ_CỦA_BẠN
 Tải xuống và chạy script cài đặt:
 
 ```bash
-wget -O enhanced-setup-server.sh https://raw.githubusercontent.com/yourusername/autodeploy-scripts/main/enhanced-setup-server.sh
+wget -O enhanced-setup-server.sh https://raw.githubusercontent.com/minhminhfreelancer/auto-install-nodejs/main/enhanced-setup-server.sh
 chmod +x enhanced-setup-server.sh
 sudo ./enhanced-setup-server.sh --domain tenmiền.com
 ```
