@@ -102,6 +102,45 @@ log "Phát hiện hệ điều hành: $OS"
 # Cài đặt các gói phụ thuộc dựa theo hệ điều hành
 log "Cài đặt các gói phụ thuộc..."
 
+# Định nghĩa hàm cài đặt dependencies
+install_dependencies() {
+    case $OS in
+        *"CentOS"*|*"Red Hat"*|*"Fedora"*)
+            log "Cài đặt các gói cho CentOS/RHEL/Fedora..."
+            dnf update -y
+            dnf install -y git nginx nodejs npm certbot python3-certbot-nginx postgresql postgresql-server postgresql-contrib postfix mailx uuid pwgen cron
+            
+            # Khởi tạo PostgreSQL
+            postgresql-setup --initdb
+            
+            # Cài đặt PM2 toàn cục
+            npm install -g pm2
+            
+            # Bật và khởi động dịch vụ
+            systemctl enable nginx postgresql postfix crond
+            systemctl start nginx postgresql postfix crond
+            ;;
+            
+        *"Ubuntu"*|*"Debian"*)
+            log "Cài đặt các gói cho Ubuntu/Debian..."
+            apt update
+            apt install -y git nginx nodejs npm certbot python3-certbot-nginx postgresql postgresql-contrib postfix mailutils uuid pwgen cron
+            
+            # Cài đặt PM2 toàn cục
+            npm install -g pm2
+            
+            # Bật và khởi động dịch vụ
+            systemctl enable nginx postgresql postfix cron
+            systemctl start nginx postgresql postfix cron
+            ;;
+            
+        *)
+            error "Hệ điều hành không được hỗ trợ: $OS"
+            exit 1
+            ;;
+    esac
+}
+
 # Kiểm tra khả năng sử dụng các dịch vụ chính
 check_services_availability() {
     log "Kiểm tra các dịch vụ cần thiết..."
@@ -154,46 +193,69 @@ check_services_availability() {
     return 0
 }
 
-install_dependencies
-check_services_availability || error "Có lỗi khi kiểm tra dịch vụ. Vui lòng kiểm tra lại cài đặt!"() {
-    case $OS in
-        *"CentOS"*|*"Red Hat"*|*"Fedora"*)
-            log "Cài đặt các gói cho CentOS/RHEL/Fedora..."
-            dnf update -y
-            dnf install -y git nginx nodejs npm certbot python3-certbot-nginx postgresql postgresql-server postgresql-contrib postfix mailx uuid pwgen cron
-            
-            # Khởi tạo PostgreSQL
-            postgresql-setup --initdb
-            
-            # Cài đặt PM2 toàn cục
-            npm install -g pm2
-            
-            # Bật và khởi động dịch vụ
-            systemctl enable nginx postgresql postfix crond
-            systemctl start nginx postgresql postfix crond
-            ;;
-            
-        *"Ubuntu"*|*"Debian"*)
-            log "Cài đặt các gói cho Ubuntu/Debian..."
-            apt update
-            apt install -y git nginx nodejs npm certbot python3-certbot-nginx postgresql postgresql-contrib postfix mailutils uuid pwgen cron
-            
-            # Cài đặt PM2 toàn cục
-            npm install -g pm2
-            
-            # Bật và khởi động dịch vụ
-            systemctl enable nginx postgresql postfix cron
-            systemctl start nginx postgresql postfix cron
-            ;;
-            
-        *)
-            error "Hệ điều hành không được hỗ trợ: $OS"
-            exit 1
-            ;;
-    esac
+# Chuyển đến thư mục và checkout nhánh
+    cd "$temp_dir" || return 1
+    git checkout "$branch" &> /dev/null
+    
+    # Lấy commit hash mới nhất
+    local latest_commit=$(git rev-parse HEAD)
+    
+    # Lấy commit hash cuối cùng đã deploy
+    local last_commit=$(grep -o '"lastCommit": "[^"]*"' "$config_file" | cut -d'"' -f4)
+    
+    # Nếu chưa có commit hash trong cấu hình hoặc commit hash đã thay đổi
+    if [ "$last_commit" = "null" ] || [ "$latest_commit" != "$last_commit" ]; then
+        # Cập nhật commit hash mới nhất
+        sed -i "s/\"lastCommit\": .*,/\"lastCommit\": \"$latest_commit\",/" "$config_file"
+        
+        # Dọn dẹp
+        rm -rf "$temp_dir"
+        
+        # Có cập nhật mới
+        return 0
+    else
+        # Dọn dẹp
+        rm -rf "$temp_dir"
+        
+        # Không có cập nhật mới
+        return 1
+    fi
 }
 
+# Hàm clone repo từ Git URL
+clone_repository() {
+    local site_name=$1
+    local git_url=$2
+    local branch=$3
+    local repo_dir="$AUTODEPLOY_ROOT/repos/$site_name.git"
+    
+    log "Clone repository từ $git_url cho $site_name..."
+    
+    # Xóa repo cũ nếu có
+    if [ -d "$repo_dir" ]; then
+        rm -rf "$repo_dir"
+    fi
+    
+    # Tạo thư mục cho repo
+    mkdir -p "$repo_dir"
+    
+    # Clone bare repository
+    git clone --mirror "$git_url" "$repo_dir"
+    
+    if [ $? -ne 0 ]; then
+        error "Không thể clone repository từ $git_url"
+        return 1
+    fi
+    
+    # Tạo hook post-receive
+    generate_post_receive_hook "$site_name"
+    
+    return 0
+}ạy cài đặt dependencies
 install_dependencies
+
+# Kiểm tra các dịch vụ sau khi cài đặt
+check_services_availability || error "Có lỗi khi kiểm tra dịch vụ. Vui lòng kiểm tra lại cài đặt!"
 
 # Mở cổng tường lửa
 log "Cấu hình tường lửa..."
@@ -240,8 +302,838 @@ fi
 # Tạo các script chính
 log "Tạo các script chính..."
 
+# Đảm bảo thư mục scripts tồn tại
+mkdir -p $AUTODEPLOY_ROOT/scripts
+
 # utils.sh - Các hàm tiện ích
-cat > $AUTODEPLOY_ROOT/scripts/utils.sh << 'EOL'
+cat > $AUTODEPLOY_ROOT/scripts/utils.sh << 'EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/utils.sh
+
+# Tạo script add-site.sh
+cat > $AUTODEPLOY_ROOT/scripts/add-site.sh << 'EOL'
+#!/bin/bash
+
+# Script thêm một trang web mới vào hệ thống auto-deploy
+
+# Đảm bảo script chạy với quyền root
+if [[ $EUID -ne 0 ]]; then
+   echo "Script này phải được chạy với quyền root" 
+   exit 1
+fi
+
+# Nạp các hàm tiện ích
+source "/opt/autodeploy/scripts/utils.sh"
+
+# Hiển thị cách sử dụng
+show_usage() {
+    echo "Sử dụng: $0 <site_name> <git_url> [options]"
+    echo ""
+    echo "Arguments:"
+    echo "  <site_name>              Tên site (sẽ tạo subdomain site_name.nodejs.io.vn)"
+    echo "  <git_url>                URL của repository Git để clone"
+    echo ""
+    echo "Options:"
+    echo "  --type <type>            Loại dự án (static, spa, node, fullstack) (mặc định: fullstack)"
+    echo "  --port <port>            Cổng cho ứng dụng Node.js (tự động nếu không được chỉ định)"
+    echo "  --branch <branch>        Nhánh Git để triển khai (mặc định: main)"
+    echo "  --build-cmd <command>    Lệnh build (mặc định: npm run build)"
+    echo "  --start-cmd <command>    Lệnh khởi động Node.js (mặc định: npm start)"
+    echo "  --custom-domain <domain> Tên miền tùy chỉnh (nếu không sử dụng subdomain mặc định)"
+    echo ""
+    echo "Ví dụ:"
+    echo "  $0 myapp https://github.com/user/repo.git --type fullstack --branch main"
+    echo "  $0 myapp https://github.com/user/repo.git --custom-domain example.com"
+    exit 1
+}
+
+# Kiểm tra tham số
+if [ $# -lt 2 ]; then
+    show_usage
+fi
+
+SITE_NAME=$1
+GIT_URL=$2
+shift 2
+
+# Kiểm tra tên site có hợp lệ không
+if ! is_valid_site_name "$SITE_NAME"; then
+    error "Tên site không hợp lệ: $SITE_NAME"
+    show_usage
+fi
+
+# Kiểm tra Git URL có hợp lệ không
+if ! is_valid_git_url "$GIT_URL"; then
+    error "URL Git không hợp lệ: $GIT_URL"
+    show_usage
+fi
+
+# Kiểm tra xem site đã tồn tại chưa
+if site_exists "$SITE_NAME"; then
+    error "Site $SITE_NAME đã tồn tại trong hệ thống"
+    exit 1
+fi
+
+# Thiết lập giá trị mặc định
+TYPE="fullstack"
+PORT=$(get_next_available_port)
+BRANCH="main"
+BUILD_CMD="npm run build"
+START_CMD="npm start"
+CUSTOM_DOMAIN=""
+
+# Xử lý các tham số tùy chọn
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --type)
+            TYPE="$2"
+            if [[ ! "$TYPE" =~ ^(static|spa|node|fullstack)$ ]]; then
+                error "Loại dự án không hợp lệ. Phải là: static, spa, node, hoặc fullstack"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
+            if ! is_valid_port "$PORT"; then
+                error "Cổng không hợp lệ. Phải là số từ 1024 đến 65535"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --branch)
+            BRANCH="$2"
+            shift 2
+            ;;
+        --build-cmd)
+            BUILD_CMD="$2"
+            shift 2
+            ;;
+        --start-cmd)
+            START_CMD="$2"
+            shift 2
+            ;;
+        --custom-domain)
+            CUSTOM_DOMAIN="$2"
+            if ! is_valid_domain "$CUSTOM_DOMAIN"; then
+                error "Tên miền không hợp lệ: $CUSTOM_DOMAIN"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            error "Tham số không được hỗ trợ: $1"
+            show_usage
+            ;;
+    esac
+done
+
+# Xác định domain sẽ sử dụng
+if [ -z "$CUSTOM_DOMAIN" ]; then
+    DOMAIN=$(generate_subdomain "$SITE_NAME")
+else
+    DOMAIN="$CUSTOM_DOMAIN"
+fi
+
+# Tạo cấu trúc thư mục cần thiết
+log "Tạo cấu trúc thư mục cho $SITE_NAME..."
+create_deployment_dirs "$SITE_NAME"
+
+# Clone repository
+log "Clone repository từ $GIT_URL..."
+clone_repository "$SITE_NAME" "$GIT_URL" "$BRANCH"
+
+# Tạo database PostgreSQL
+log "Tạo database PostgreSQL..."
+create_postgres_db "$SITE_NAME"
+
+# Tạo tài khoản email
+log "Tạo tài khoản email..."
+create_email_account "$SITE_NAME" "$DOMAIN"
+
+# Tạo cấu hình site
+log "Tạo cấu hình cho $SITE_NAME..."
+generate_site_config "$SITE_NAME" "$DOMAIN" "$GIT_URL" "$PORT" "$TYPE" "$BRANCH" "$BUILD_CMD" "$START_CMD"
+
+# Tạo cấu hình Nginx
+log "Tạo cấu hình Nginx cho $DOMAIN..."
+STATIC_PATH="$AUTODEPLOY_ROOT/www/$SITE_NAME"
+
+if [[ "$TYPE" == "static" ]]; then
+    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "false" "false"
+elif [[ "$TYPE" == "spa" ]]; then
+    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "true" "false"
+elif [[ "$TYPE" == "node" ]]; then
+    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "false" "true"
+elif [[ "$TYPE" == "fullstack" ]]; then
+    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "true" "true"
+fi
+
+# Thiết lập SSL
+log "Thiết lập SSL cho $DOMAIN..."
+setup_ssl "$DOMAIN"
+
+# Cài đặt webhook hoặc tạo cron job cho kiểm tra tự động
+log "Thiết lập kiểm tra tự động cập nhật Git..."
+CHECKER_SCRIPT="$AUTODEPLOY_ROOT/scripts/check-updates.sh"
+CRON_JOB="* * * * * root $CHECKER_SCRIPT $SITE_NAME > /dev/null 2>&1"
+
+# Thêm cronjob cho site mới
+grep -q "$SITE_NAME" /etc/crontab || echo "$CRON_JOB" >> /etc/crontab
+
+# Triển khai lần đầu
+log "Triển khai lần đầu cho $SITE_NAME..."
+$AUTODEPLOY_ROOT/scripts/deploy.sh "$SITE_NAME"
+
+# Hoàn tất
+log "Đã thêm site $SITE_NAME thành công!"
+echo ""
+echo "Thông tin trang web:"
+echo "- Tên site: $SITE_NAME"
+echo "- Tên miền: $DOMAIN"
+echo "- Repository: $GIT_URL (nhánh $BRANCH)"
+echo "- Loại: $TYPE"
+echo "- Cổng: $PORT"
+echo ""
+echo "Thông tin database PostgreSQL:"
+echo "- Lưu trong file: $AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env"
+cat "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env"
+echo ""
+echo "Thông tin email SMTP:"
+echo "- Lưu trong file: $AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env"
+cat "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env"
+echo ""
+echo "Hướng dẫn cập nhật ứng dụng:"
+echo "1. Push code lên repository gốc. Hệ thống sẽ tự động kiểm tra mỗi 5 giây và triển khai khi có cập nhật mới."
+echo "2. Hoặc thêm webhook từ GitHub/GitLab tới: (đang phát triển)"
+echo ""
+echo "Để xem log triển khai: tail -f $AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
+EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/add-site.sh
+
+# Tạo script deploy.sh
+cat > $AUTODEPLOY_ROOT/scripts/deploy.sh << 'EOL'
+#!/bin/bash
+
+# Script triển khai cho một trang web
+# Sử dụng: ./deploy.sh <site_name>
+
+# Kiểm tra tham số
+if [ $# -lt 1 ]; then
+    echo "Sử dụng: $0 <site_name>"
+    exit 1
+fi
+
+# Nạp các hàm tiện ích
+source "/opt/autodeploy/scripts/utils.sh"
+
+SITE_NAME=$1
+CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
+LOG_FILE="$AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
+WWW_DIR="$AUTODEPLOY_ROOT/www/$SITE_NAME"
+REPO_DIR="$AUTODEPLOY_ROOT/repos/$SITE_NAME.git"
+TEMP_DIR=$(mktemp -d)
+
+# Đảm bảo log file tồn tại
+touch "$LOG_FILE"
+
+# Hàm ghi log đặc biệt cho quá trình triển khai
+deploy_log() {
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Xử lý khi có lỗi
+handle_error() {
+    deploy_log "LỖI: $1"
+    
+    # Gửi email thông báo lỗi
+    if [ -f "$AUTODEPLOY_ROOT/config/global.json" ]; then
+        ADMIN_EMAIL=$(grep -o '"adminEmail": "[^"]*"' "$AUTODEPLOY_ROOT/config/global.json" | cut -d'"' -f4)
+        if [ -n "$ADMIN_EMAIL" ]; then
+            echo "Lỗi triển khai $SITE_NAME: $1" | mail -s "[AUTODEPLOY ERROR] Lỗi triển khai $SITE_NAME" "$ADMIN_EMAIL"
+        fi
+    fi
+    
+    rm -rf "$TEMP_DIR"
+    exit 1
+}
+
+# Kiểm tra xem cấu hình có tồn tại không
+if [ ! -f "$CONFIG_FILE" ]; then
+    handle_error "Không tìm thấy cấu hình cho site $SITE_NAME"
+fi
+
+# Đọc cấu hình
+DOMAIN=$(grep -o '"domain": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+GIT_URL=$(grep -o '"gitUrl": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+TYPE=$(grep -o '"type": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+PORT=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}')
+BRANCH=$(grep -o '"branch": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+BUILD_CMD=$(grep -o '"buildCommand": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+START_CMD=$(grep -o '"startCommand": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+
+deploy_log "Bắt đầu triển khai $SITE_NAME (Domain: $DOMAIN, Loại: $TYPE, Nhánh: $BRANCH)"
+
+# Clone repository vào thư mục tạm
+deploy_log "Clone repository vào thư mục tạm..."
+git clone "$REPO_DIR" "$TEMP_DIR" 2>> "$LOG_FILE" || handle_error "Không thể clone repository"
+
+# Chuyển đến thư mục tạm và checkout nhánh yêu cầu
+cd "$TEMP_DIR" || handle_error "Không thể chuyển đến thư mục tạm"
+git checkout "$BRANCH" 2>> "$LOG_FILE" || handle_error "Không thể checkout nhánh $BRANCH"
+
+# Lấy commit hash hiện tại
+CURRENT_COMMIT=$(git rev-parse HEAD)
+deploy_log "Commit hiện tại: $CURRENT_COMMIT"
+
+# Cập nhật commit hash trong cấu hình
+sed -i "s/\"lastCommit\": .*,/\"lastCommit\": \"$CURRENT_COMMIT\",/" "$CONFIG_FILE"
+
+# Sao chép các file cấu hình database và email vào thư mục tạm
+if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" ]; then
+    deploy_log "Sao chép cấu hình database..."
+    cp "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" "$TEMP_DIR/.env.db"
+fi
+
+if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env" ]; then
+    deploy_log "Sao chép cấu hình email..."
+    cp "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env" "$TEMP_DIR/.env.email"
+fi
+
+# Tạo hoặc cập nhật file .env
+deploy_log "Tạo file .env..."
+cat > "$TEMP_DIR/.env" << EOF
+# Tự động tạo bởi hệ thống auto-deploy
+NODE_ENV=production
+PORT=$PORT
+EOF
+
+# Thêm cấu hình database và email vào .env
+if [ -f "$TEMP_DIR/.env.db" ]; then
+    cat "$TEMP_DIR/.env.db" >> "$TEMP_DIR/.env"
+fi
+
+if [ -f "$TEMP_DIR/.env.email" ]; then
+    cat "$TEMP_DIR/.env.email" >> "$TEMP_DIR/.env"
+fi
+
+# Cài đặt dependencies nếu có package.json
+if [ -f "$TEMP_DIR/package.json" ]; then
+    deploy_log "Cài đặt dependencies..."
+    cd "$TEMP_DIR" && npm install --production 2>> "$LOG_FILE" || handle_error "Không thể cài đặt dependencies"
+    
+    # Chạy lệnh build nếu cần
+    if [[ "$TYPE" != "node" && -n "$BUILD_CMD" ]]; then
+        deploy_log "Chạy lệnh build: $BUILD_CMD"
+        cd "$TEMP_DIR" && eval "$BUILD_CMD" 2>> "$LOG_FILE" || handle_error "Không thể build dự án"
+    fi
+fi
+
+# Xác định thư mục chứa mã nguồn cuối cùng
+if [[ "$TYPE" == "static" || "$TYPE" == "spa" ]]; then
+    # Kiểm tra xem build output có thể nằm trong thư mục build hay dist
+    if [ -d "$TEMP_DIR/build" ]; then
+        FINAL_DIR="$TEMP_DIR/build"
+    elif [ -d "$TEMP_DIR/dist" ]; then
+        FINAL_DIR="$TEMP_DIR/dist"
+    else
+        FINAL_DIR="$TEMP_DIR"
+    fi
+else
+    FINAL_DIR="$TEMP_DIR"
+fi
+
+# Đảm bảo thư mục www tồn tại
+mkdir -p "$WWW_DIR"
+
+# Triển khai mã nguồn
+deploy_log "Triển khai mã nguồn đến $WWW_DIR..."
+if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
+    # Đối với ứng dụng Node.js, sao chép toàn bộ mã nguồn
+    rsync -a --delete --exclude='.git' "$TEMP_DIR/" "$WWW_DIR/" 2>> "$LOG_FILE" || handle_error "Không thể sao chép mã nguồn"
+else
+    # Đối với static/spa, chỉ sao chép nội dung build
+    rsync -a --delete "$FINAL_DIR/" "$WWW_DIR/" 2>> "$LOG_FILE" || handle_error "Không thể sao chép mã nguồn"
+fi
+
+# Thiết lập quyền
+deploy_log "Thiết lập quyền..."
+chown -R www-data:www-data "$WWW_DIR" 2>> "$LOG_FILE" || deploy_log "Cảnh báo: Không thể thiết lập quyền cho thư mục $WWW_DIR"
+
+# Xử lý ứng dụng Node.js với PM2
+if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
+    deploy_log "Quản lý ứng dụng Node.js với PM2..."
+    
+    # Kiểm tra xem ứng dụng đã được khởi tạo trong PM2 chưa
+    if pm2 list | grep -q "$SITE_NAME"; then
+        # Nếu đã tồn tại, restart ứng dụng
+        deploy_log "Khởi động lại ứng dụng trong PM2..."
+        cd "$WWW_DIR" && pm2 restart "$SITE_NAME" 2>> "$LOG_FILE" || handle_error "Không thể khởi động lại ứng dụng"
+    else
+        # Nếu chưa tồn tại, thêm ứng dụng mới vào PM2
+        deploy_log "Thêm ứng dụng vào PM2..."
+        
+        # Xác định entry point
+        if [ -f "$WWW_DIR/ecosystem.config.js" ]; then
+            # Sử dụng ecosystem.config.js nếu có
+            cd "$WWW_DIR" && pm2 start ecosystem.config.js 2>> "$LOG_FILE" || handle_error "Không thể khởi động ứng dụng với ecosystem.config.js"
+        elif [ -f "$WWW_DIR/package.json" ]; then
+            # Tìm entry point từ package.json
+            if grep -q '"main"' "$WWW_DIR/package.json"; then
+                ENTRY_POINT=$(grep -o '"main": "[^"]*"' "$WWW_DIR/package.json" | cut -d'"' -f4)
+                cd "$WWW_DIR" && pm2 start "$ENTRY_POINT" --name "$SITE_NAME" --env production 2>> "$LOG_FILE" || handle_error "Không thể khởi động ứng dụng với entry point từ package.json"
+            else
+                # Sử dụng start command đã cấu hình
+                cd "$WWW_DIR" && pm2 start --name "$SITE_NAME" --env production npm -- start 2>> "$LOG_FILE" || handle_error "Không thể khởi động ứng dụng với start command"
+            fi
+        else
+            handle_error "Không thể xác định cách khởi động ứng dụng Node.js"
+        fi
+    fi
+    
+    # Lưu cấu hình PM2
+    deploy_log "Lưu cấu hình PM2..."
+    pm2 save 2>> "$LOG_FILE" || deploy_log "Cảnh báo: Không thể lưu cấu hình PM2"
+}
+
+# Cập nhật thời gian triển khai cuối cùng trong cấu hình
+sed -i "s/\"lastDeploy\": .*,/\"lastDeploy\": \"$(date '+%Y-%m-%d %H:%M:%S')\",/" "$CONFIG_FILE"
+
+# Dọn dẹp
+deploy_log "Dọn dẹp..."
+rm -rf "$TEMP_DIR"
+
+deploy_log "Triển khai $SITE_NAME thành công!"
+EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/deploy.sh
+
+# Tạo script check-updates.sh
+cat > $AUTODEPLOY_ROOT/scripts/check-updates.sh << 'EOL'
+#!/bin/bash
+
+# Script kiểm tra cập nhật Git tự động
+# Sử dụng: ./check-updates.sh <site_name>
+
+# Kiểm tra tham số
+if [ $# -lt 1 ]; then
+    echo "Sử dụng: $0 <site_name>"
+    exit 1
+fi
+
+# Nạp các hàm tiện ích
+source "/opt/autodeploy/scripts/utils.sh"
+
+SITE_NAME=$1
+CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
+
+# Kiểm tra xem cấu hình có tồn tại không
+if [ ! -f "$CONFIG_FILE" ]; then
+    error "Không tìm thấy cấu hình cho site $SITE_NAME"
+    exit 1
+fi
+
+# Đọc cấu hình
+GIT_URL=$(grep -o '"gitUrl": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+BRANCH=$(grep -o '"branch": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+
+# Kiểm tra cập nhật
+if check_git_update "$SITE_NAME" "$GIT_URL" "$BRANCH"; then
+    log "Phát hiện cập nhật mới cho $SITE_NAME. Đang triển khai..."
+    
+    # Thực hiện triển khai
+    $AUTODEPLOY_ROOT/scripts/deploy.sh "$SITE_NAME"
+fi
+
+exit 0
+EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/check-updates.sh
+
+# Tạo script remove-site.sh
+cat > $AUTODEPLOY_ROOT/scripts/remove-site.sh << 'EOL'
+#!/bin/bash
+
+# Script xóa một trang web khỏi hệ thống auto-deploy
+# Sử dụng: ./remove-site.sh <site_name> [--force]
+
+# Đảm bảo script chạy với quyền root
+if [[ $EUID -ne 0 ]]; then
+   echo "Script này phải được chạy với quyền root" 
+   exit 1
+fi
+
+# Nạp các hàm tiện ích
+source "/opt/autodeploy/scripts/utils.sh"
+
+# Kiểm tra tham số
+if [ $# -lt 1 ]; then
+    echo "Sử dụng: $0 <site_name> [--force]"
+    exit 1
+fi
+
+SITE_NAME=$1
+FORCE=0
+
+if [ "$2" == "--force" ]; then
+    FORCE=1
+fi
+
+# Kiểm tra xem site có tồn tại không
+if ! site_exists "$SITE_NAME"; then
+    error "Site $SITE_NAME không tồn tại trong hệ thống"
+    exit 1
+fi
+
+# Đọc cấu hình site
+CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
+DOMAIN=$(grep -o '"domain": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+TYPE=$(grep -o '"type": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+
+# Xác nhận xóa nếu không có tham số --force
+if [ $FORCE -eq 0 ]; then
+    read -p "Bạn có chắc chắn muốn xóa site $SITE_NAME ($DOMAIN)? Điều này sẽ xóa tất cả dữ liệu liên quan. (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log "Hủy thao tác xóa"
+        exit 0
+    fi
+fi
+
+# Dừng ứng dụng Node.js nếu có
+if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
+    if pm2 list | grep -q "$SITE_NAME"; then
+        log "Dừng ứng dụng Node.js..."
+        pm2 delete "$SITE_NAME" && pm2 save
+    fi
+fi
+
+# Đọc thông tin database
+if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" ]; then
+    DB_USER=$(grep "DB_USER=" "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" | cut -d'=' -f2)
+    DB_NAME=$(grep "DB_NAME=" "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" | cut -d'=' -f2)
+    
+    # Xóa database và user
+    log "Xóa database PostgreSQL..."
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" > /dev/null 2>&1
+    sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" > /dev/null 2>&1
+fi
+
+# Xóa cấu hình Nginx và SSL
+log "Xóa cấu hình Nginx và SSL..."
+if [ -f "/etc/nginx/conf.d/$DOMAIN.conf" ]; then
+    rm "/etc/nginx/conf.d/$DOMAIN.conf"
+    
+    # Xóa cấu hình SSL
+    if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+        certbot delete --cert-name "$DOMAIN" --non-interactive
+    fi
+    
+    systemctl reload nginx
+fi
+
+# Xóa cron job
+log "Xóa cron job..."
+sed -i "/$SITE_NAME/d" /etc/crontab
+
+# Xóa các thư mục và file liên quan
+log "Xóa mã nguồn và cấu hình..."
+rm -rf "$AUTODEPLOY_ROOT/www/$SITE_NAME"
+rm -rf "$AUTODEPLOY_ROOT/repos/$SITE_NAME.git"
+rm -f "$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
+rm -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env"
+rm -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env"
+rm -f "$AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
+rm -rf "$AUTODEPLOY_ROOT/logs/nginx/$SITE_NAME"
+
+log "Đã xóa site $SITE_NAME thành công!"
+EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/remove-site.sh
+
+# Tạo script list-sites.sh
+cat > $AUTODEPLOY_ROOT/scripts/list-sites.sh << 'EOL'
+#!/bin/bash
+
+# Script liệt kê các trang web trong hệ thống auto-deploy
+# Sử dụng: ./list-sites.sh [--format json]
+
+# Nạp các hàm tiện ích
+source "/opt/autodeploy/scripts/utils.sh"
+
+# Kiểm tra định dạng output
+FORMAT="table"
+if [ "$1" == "--format" ] && [ "$2" == "json" ]; then
+    FORMAT="json"
+fi
+
+# Đếm số lượng sites
+SITES_COUNT=$(ls -1 $AUTODEPLOY_ROOT/config/sites/*.json 2>/dev/null | grep -v "_db.env\|_email.env" | wc -l)
+
+if [ $SITES_COUNT -eq 0 ]; then
+    if [ "$FORMAT" == "json" ]; then
+        echo "[]"
+    else
+        echo "Không có trang web nào trong hệ thống."
+    fi
+    exit 0
+fi
+
+# Hiển thị thông tin theo định dạng JSON
+if [ "$FORMAT" == "json" ]; then
+    echo "["
+    COUNTER=0
+    for config_file in $AUTODEPLOY_ROOT/config/sites/*.json; do
+        # Bỏ qua các file cấu hình database và email
+        if [[ "$config_file" != *"_db.env"* && "$config_file" != *"_email.env"* ]]; then
+            COUNTER=$((COUNTER+1))
+            cat "$config_file"
+            if [ $COUNTER -lt $SITES_COUNT ]; then
+                echo ","
+            fi
+        fi
+    done
+    echo "]"
+else
+    # Hiển thị thông tin dạng bảng
+    printf "%-20s %-30s %-15s %-10s %-15s %-25s\n" "SITE NAME" "DOMAIN" "TYPE" "PORT" "BRANCH" "LAST DEPLOY"
+    printf "%-20s %-30s %-15s %-10s %-15s %-25s\n" "--------------------" "------------------------------" "---------------" "----------" "---------------" "-------------------------"
+    
+    for config_file in $AUTODEPLOY_ROOT/config/sites/*.json; do
+        # Bỏ qua các file cấu hình database và email
+        if [[ "$config_file" != *"_db.env"* && "$config_file" != *"_email.env"* ]]; then
+            SITE_NAME=$(grep -o '"siteName": "[^"]*"' "$config_file" | cut -d'"' -f4)
+            DOMAIN=$(grep -o '"domain": "[^"]*"' "$config_file" | cut -d'"' -f4)
+            TYPE=$(grep -o '"type": "[^"]*"' "$config_file" | cut -d'"' -f4)
+            PORT=$(grep -o '"port": [0-9]*' "$config_file" | awk '{print $2}')
+            BRANCH=$(grep -o '"branch": "[^"]*"' "$config_file" | cut -d'"' -f4)
+            LAST_DEPLOY=$(grep -o '"lastDeploy": "[^"]*"' "$config_file" | cut -d'"' -f4)
+            
+            if [ "$LAST_DEPLOY" == "null" ]; then
+                LAST_DEPLOY="Chưa triển khai"
+            fi
+            
+            printf "%-20s %-30s %-15s %-10s %-15s %-25s\n" "$SITE_NAME" "$DOMAIN" "$TYPE" "$PORT" "$BRANCH" "$LAST_DEPLOY"
+        fi
+    done
+fi
+EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/list-sites.sh
+
+# Tạo script debug.sh
+cat > $AUTODEPLOY_ROOT/scripts/debug.sh << 'EOL'
+#!/bin/bash
+
+# Script hiển thị thông tin debug
+# Sử dụng: ./debug.sh <site_name>
+
+# Nạp các hàm tiện ích
+source "/opt/autodeploy/scripts/utils.sh"
+
+# Kiểm tra tham số
+if [ $# -lt 1 ]; then
+    echo "Sử dụng: $0 <site_name>"
+    exit 1
+fi
+
+SITE_NAME=$1
+CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
+
+# Kiểm tra xem site có tồn tại không
+if ! site_exists "$SITE_NAME"; then
+    error "Site $SITE_NAME không tồn tại trong hệ thống"
+    exit 1
+fi
+
+# Đọc cấu hình site
+DOMAIN=$(grep -o '"domain": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+GIT_URL=$(grep -o '"gitUrl": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+TYPE=$(grep -o '"type": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+PORT=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}')
+BRANCH=$(grep -o '"branch": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+LAST_DEPLOY=$(grep -o '"lastDeploy": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+LAST_CHECK=$(grep -o '"lastCheck": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+LAST_COMMIT=$(grep -o '"lastCommit": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
+
+echo "=== THÔNG TIN DEBUG CHO $SITE_NAME ==="
+echo ""
+echo "Thông tin cơ bản:"
+echo "- Tên site: $SITE_NAME"
+echo "- Tên miền: $DOMAIN"
+echo "- Repository: $GIT_URL (nhánh $BRANCH)"
+echo "- Loại: $TYPE"
+echo "- Cổng: $PORT"
+echo "- Triển khai cuối: $LAST_DEPLOY"
+echo "- Kiểm tra cuối: $LAST_CHECK"
+echo "- Commit cuối: $LAST_COMMIT"
+echo ""
+
+echo "Kiểm tra dịch vụ:"
+echo "- Nginx:"
+if systemctl is-active --quiet nginx; then
+    echo "  + Trạng thái: Đang chạy"
+else
+    echo "  + Trạng thái: KHÔNG CHẠY"
+fi
+
+echo "  + Cấu hình site:"
+if [ -f "/etc/nginx/conf.d/$DOMAIN.conf" ]; then
+    echo "    * Đã tìm thấy cấu hình"
+    nginx -t
+else
+    echo "    * KHÔNG TÌM THẤY cấu hình"
+fi
+
+echo "- SSL:"
+if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+    echo "  + Đã cài đặt SSL"
+    certbot certificates -d "$DOMAIN"
+else
+    echo "  + CHƯA cài đặt SSL"
+fi
+
+echo "- PostgreSQL:"
+if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" ]; then
+    DB_NAME=$(grep "DB_NAME=" "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" | cut -d'=' -f2)
+    echo "  + Database: $DB_NAME"
+    # Kiểm tra xem database có tồn tại không
+    if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
+        echo "  + Trạng thái: Database tồn tại"
+    else
+        echo "  + Trạng thái: DATABASE KHÔNG TỒN TẠI"
+    fi
+else
+    echo "  + KHÔNG TÌM THẤY cấu hình database"
+fi
+
+echo "- Node.js PM2:"
+if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
+    if pm2 list | grep -q "$SITE_NAME"; then
+        echo "  + Trạng thái: Đang chạy"
+        pm2 show "$SITE_NAME"
+    else
+        echo "  + Trạng thái: KHÔNG CHẠY"
+    fi
+else
+    echo "  + Không áp dụng cho loại site này"
+fi
+
+echo ""
+echo "Các đường dẫn quan trọng:"
+echo "- Thư mục mã nguồn: $AUTODEPLOY_ROOT/www/$SITE_NAME"
+echo "- Repository Git: $AUTODEPLOY_ROOT/repos/$SITE_NAME.git"
+echo "- File cấu hình: $CONFIG_FILE"
+echo "- File log triển khai: $AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
+echo "- File log Nginx: $AUTODEPLOY_ROOT/logs/nginx/$SITE_NAME/access.log và error.log"
+
+echo ""
+echo "10 dòng log triển khai gần đây nhất:"
+tail -n 10 "$AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log" 2>/dev/null || echo "Không tìm thấy file log"
+
+echo ""
+echo "Kiểm tra kết nối:"
+if ping -c 1 "$DOMAIN" &> /dev/null; then
+    echo "- Có thể ping tới $DOMAIN"
+else
+    echo "- KHÔNG THỂ ping tới $DOMAIN"
+fi
+
+if curl -s --head "http://$DOMAIN" &> /dev/null; then
+    echo "- HTTP (80) có thể kết nối"
+else
+    echo "- HTTP (80) KHÔNG THỂ kết nối"
+fi
+
+if curl -s --head "https://$DOMAIN" &> /dev/null; then
+    echo "- HTTPS (443) có thể kết nối"
+else
+    echo "- HTTPS (443) KHÔNG THỂ kết nối"
+fi
+
+if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
+    if curl -s "http://localhost:$PORT" &> /dev/null; then
+        echo "- Cổng $PORT có thể kết nối (Node.js)"
+    else
+        echo "- Cổng $PORT KHÔNG THỂ kết nối (Node.js)"
+    fi
+fi
+
+echo ""
+echo "Các lệnh hữu ích:"
+echo "- Triển khai lại: $AUTODEPLOY_ROOT/scripts/deploy.sh $SITE_NAME"
+echo "- Xem log triển khai: tail -f $AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
+echo "- Xem log Nginx: tail -f $AUTODEPLOY_ROOT/logs/nginx/$SITE_NAME/error.log"
+if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
+    echo "- Xem log PM2: pm2 logs $SITE_NAME"
+    echo "- Restart ứng dụng: pm2 restart $SITE_NAME"
+fi
+EOL
+chmod +x $AUTODEPLOY_ROOT/scripts/debug.sh
+
+# Thiết lập quyền thực thi cho các script
+chmod +x $AUTODEPLOY_ROOT/scripts/*.sh
+
+# Tạo cấu hình toàn cục
+cat > $AUTODEPLOY_ROOT/config/global.json << EOL
+{
+    "version": "1.0.0",
+    "setupDate": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "serverName": "$(hostname)",
+    "mainDomain": "$MAIN_DOMAIN",
+    "useHttps": true,
+    "defaultBranch": "main",
+    "adminEmail": "admin@$MAIN_DOMAIN",
+    "checkInterval": 5
+}
+EOL
+
+# Tạo cron job mẫu cho check-updates.sh
+cat > /etc/cron.d/autodeploy << 'EOL'
+# Cron job cho hệ thống auto-deploy
+# Kiểm tra cập nhật mỗi phút cho tất cả các site
+
+*/1 * * * * root find /opt/autodeploy/config/sites -name "*.json" -not -path "*_db.env*" -not -path "*_email.env*" -exec basename {} \; | sed 's/\.json$//' | xargs -I{} /opt/autodeploy/scripts/check-updates.sh {} >/dev/null 2>&1
+EOL
+
+chmod 644 /etc/cron.d/autodeploy
+
+# Tạo tệp init.d để khởi động lại PM2 khi khởi động
+log "Cấu hình PM2 để tự khởi động khi server khởi động..."
+env PATH=$PATH:/usr/bin pm2 startup -u root --hp /root
+pm2 save
+
+# Hiển thị hướng dẫn sử dụng
+log "Thiết lập server hoàn tất!"
+echo ""
+echo "Hệ thống auto-deploy cho $MAIN_DOMAIN đã được cài đặt thành công!"
+echo ""
+echo "CẤU HÌNH DNS QUAN TRỌNG:"
+echo "Đảm bảo bạn đã cấu hình DNS wildcard cho $MAIN_DOMAIN:"
+echo "- Bản ghi A: $MAIN_DOMAIN -> $SERVER_IP"
+echo "- Bản ghi A: *.$MAIN_DOMAIN -> $SERVER_IP"
+echo ""
+echo "Để quản lý các trang web:"
+echo "1. Thêm trang web mới:"
+echo "   $AUTODEPLOY_ROOT/scripts/add-site.sh myapp https://github.com/username/repo.git --type fullstack"
+echo ""
+echo "2. Xóa trang web:"
+echo "   $AUTODEPLOY_ROOT/scripts/remove-site.sh myapp"
+echo ""
+echo "3. Liệt kê các trang web:"
+echo "   $AUTODEPLOY_ROOT/scripts/list-sites.sh"
+echo ""
+echo "4. Debug trang web:"
+echo "   $AUTODEPLOY_ROOT/scripts/debug.sh myapp"
+echo ""
+echo "Hệ thống sẽ tự động kiểm tra cập nhật từ GitHub mỗi 5 giây và triển khai khi có cập nhật mới."
+echo "Tất cả các trang web sẽ tự động được cấu hình với SSL Let's Encrypt."
+echo ""
+echo "Mỗi trang web sẽ có:"
+echo "- Subdomain tự động tạo: <site_name>.$MAIN_DOMAIN"
+echo "- Database PostgreSQL"
+echo "- Tài khoản email SMTP"
+echo "- File .env với các thông tin cấu hình"
+echo ""
+echo "Thư mục các script: $AUTODEPLOY_ROOT/scripts/"
+echo "Thư mục cấu hình: $AUTODEPLOY_ROOT/config/"
+echo "Thư mục mã nguồn: $AUTODEPLOY_ROOT/www/"
+echo "Thư mục repository Git: $AUTODEPLOY_ROOT/repos/"
+echo "Thư mục log: $AUTODEPLOY_ROOT/logs/"'
 #!/bin/bash
 
 # Các hàm tiện ích dùng chung cho hệ thống auto-deploy
@@ -687,883 +1579,4 @@ check_git_update() {
         return 1
     fi
     
-    # Chuyển đến thư mục và checkout nhánh
-    cd "$temp_dir" || return 1
-    git checkout "$branch" &> /dev/null
-    
-    # Lấy commit hash mới nhất
-    local latest_commit=$(git rev-parse HEAD)
-    
-    # Lấy commit hash cuối cùng đã deploy
-    local last_commit=$(grep -o '"lastCommit": "[^"]*"' "$config_file" | cut -d'"' -f4)
-    
-    # Nếu chưa có commit hash trong cấu hình hoặc commit hash đã thay đổi
-    if [ "$last_commit" = "null" ] || [ "$latest_commit" != "$last_commit" ]; then
-        # Cập nhật commit hash mới nhất
-        sed -i "s/\"lastCommit\": .*,/\"lastCommit\": \"$latest_commit\",/" "$config_file"
-        
-        # Dọn dẹp
-        rm -rf "$temp_dir"
-        
-        # Có cập nhật mới
-        return 0
-    else
-        # Dọn dẹp
-        rm -rf "$temp_dir"
-        
-        # Không có cập nhật mới
-        return 1
-    fi
-}
-
-# Hàm clone repo từ Git URL
-clone_repository() {
-    local site_name=$1
-    local git_url=$2
-    local branch=$3
-    local repo_dir="$AUTODEPLOY_ROOT/repos/$site_name.git"
-    
-    log "Clone repository từ $git_url cho $site_name..."
-    
-    # Xóa repo cũ nếu có
-    if [ -d "$repo_dir" ]; then
-        rm -rf "$repo_dir"
-    fi
-    
-    # Tạo thư mục cho repo
-    mkdir -p "$repo_dir"
-    
-    # Clone bare repository
-    git clone --mirror "$git_url" "$repo_dir"
-    
-    if [ $? -ne 0 ]; then
-        error "Không thể clone repository từ $git_url"
-        return 1
-    fi
-    
-    # Tạo hook post-receive
-    generate_post_receive_hook "$site_name"
-    
-    return 0
-}
-EOL
-
-# Tạo script add-site.sh
-cat > $AUTODEPLOY_ROOT/scripts/add-site.sh << 'EOL'
-#!/bin/bash
-
-# Script thêm một trang web mới vào hệ thống auto-deploy
-
-# Đảm bảo script chạy với quyền root
-if [[ $EUID -ne 0 ]]; then
-   echo "Script này phải được chạy với quyền root" 
-   exit 1
-fi
-
-# Nạp các hàm tiện ích
-source "/opt/autodeploy/scripts/utils.sh"
-
-# Hiển thị cách sử dụng
-show_usage() {
-    echo "Sử dụng: $0 <site_name> <git_url> [options]"
-    echo ""
-    echo "Arguments:"
-    echo "  <site_name>              Tên site (sẽ tạo subdomain site_name.nodejs.io.vn)"
-    echo "  <git_url>                URL của repository Git để clone"
-    echo ""
-    echo "Options:"
-    echo "  --type <type>            Loại dự án (static, spa, node, fullstack) (mặc định: fullstack)"
-    echo "  --port <port>            Cổng cho ứng dụng Node.js (tự động nếu không được chỉ định)"
-    echo "  --branch <branch>        Nhánh Git để triển khai (mặc định: main)"
-    echo "  --build-cmd <command>    Lệnh build (mặc định: npm run build)"
-    echo "  --start-cmd <command>    Lệnh khởi động Node.js (mặc định: npm start)"
-    echo "  --custom-domain <domain> Tên miền tùy chỉnh (nếu không sử dụng subdomain mặc định)"
-    echo ""
-    echo "Ví dụ:"
-    echo "  $0 myapp https://github.com/user/repo.git --type fullstack --branch main"
-    echo "  $0 myapp https://github.com/user/repo.git --custom-domain example.com"
-    exit 1
-}
-
-# Kiểm tra tham số
-if [ $# -lt 2 ]; then
-    show_usage
-fi
-
-SITE_NAME=$1
-GIT_URL=$2
-shift 2
-
-# Kiểm tra tên site có hợp lệ không
-if ! is_valid_site_name "$SITE_NAME"; then
-    error "Tên site không hợp lệ: $SITE_NAME"
-    show_usage
-fi
-
-# Kiểm tra Git URL có hợp lệ không
-if ! is_valid_git_url "$GIT_URL"; then
-    error "URL Git không hợp lệ: $GIT_URL"
-    show_usage
-fi
-
-# Kiểm tra xem site đã tồn tại chưa
-if site_exists "$SITE_NAME"; then
-    error "Site $SITE_NAME đã tồn tại trong hệ thống"
-    exit 1
-fi
-
-# Thiết lập giá trị mặc định
-TYPE="fullstack"
-PORT=$(get_next_available_port)
-BRANCH="main"
-BUILD_CMD="npm run build"
-START_CMD="npm start"
-CUSTOM_DOMAIN=""
-
-# Xử lý các tham số tùy chọn
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --type)
-            TYPE="$2"
-            if [[ ! "$TYPE" =~ ^(static|spa|node|fullstack)$ ]]; then
-                error "Loại dự án không hợp lệ. Phải là: static, spa, node, hoặc fullstack"
-                exit 1
-            fi
-            shift 2
-            ;;
-        --port)
-            PORT="$2"
-            if ! is_valid_port "$PORT"; then
-                error "Cổng không hợp lệ. Phải là số từ 1024 đến 65535"
-                exit 1
-            fi
-            shift 2
-            ;;
-        --branch)
-            BRANCH="$2"
-            shift 2
-            ;;
-        --build-cmd)
-            BUILD_CMD="$2"
-            shift 2
-            ;;
-        --start-cmd)
-            START_CMD="$2"
-            shift 2
-            ;;
-        --custom-domain)
-            CUSTOM_DOMAIN="$2"
-            if ! is_valid_domain "$CUSTOM_DOMAIN"; then
-                error "Tên miền không hợp lệ: $CUSTOM_DOMAIN"
-                exit 1
-            fi
-            shift 2
-            ;;
-        *)
-            error "Tham số không được hỗ trợ: $1"
-            show_usage
-            ;;
-    esac
-done
-
-# Xác định domain sẽ sử dụng
-if [ -z "$CUSTOM_DOMAIN" ]; then
-    DOMAIN=$(generate_subdomain "$SITE_NAME")
-else
-    DOMAIN="$CUSTOM_DOMAIN"
-fi
-
-# Tạo cấu trúc thư mục cần thiết
-log "Tạo cấu trúc thư mục cho $SITE_NAME..."
-create_deployment_dirs "$SITE_NAME"
-
-# Clone repository
-log "Clone repository từ $GIT_URL..."
-clone_repository "$SITE_NAME" "$GIT_URL" "$BRANCH"
-
-# Tạo database PostgreSQL
-log "Tạo database PostgreSQL..."
-create_postgres_db "$SITE_NAME"
-
-# Tạo tài khoản email
-log "Tạo tài khoản email..."
-create_email_account "$SITE_NAME" "$DOMAIN"
-
-# Tạo cấu hình site
-log "Tạo cấu hình cho $SITE_NAME..."
-generate_site_config "$SITE_NAME" "$DOMAIN" "$GIT_URL" "$PORT" "$TYPE" "$BRANCH" "$BUILD_CMD" "$START_CMD"
-
-# Tạo cấu hình Nginx
-log "Tạo cấu hình Nginx cho $DOMAIN..."
-STATIC_PATH="$AUTODEPLOY_ROOT/www/$SITE_NAME"
-
-if [[ "$TYPE" == "static" ]]; then
-    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "false" "false"
-elif [[ "$TYPE" == "spa" ]]; then
-    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "true" "false"
-elif [[ "$TYPE" == "node" ]]; then
-    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "false" "true"
-elif [[ "$TYPE" == "fullstack" ]]; then
-    generate_nginx_config "$SITE_NAME" "$DOMAIN" "$PORT" "$STATIC_PATH" "true" "true"
-fi
-
-# Thiết lập SSL
-log "Thiết lập SSL cho $DOMAIN..."
-setup_ssl "$DOMAIN"
-
-# Cài đặt webhook hoặc tạo cron job cho kiểm tra tự động
-log "Thiết lập kiểm tra tự động cập nhật Git..."
-CHECKER_SCRIPT="$AUTODEPLOY_ROOT/scripts/check-updates.sh"
-CRON_JOB="* * * * * root $CHECKER_SCRIPT $SITE_NAME > /dev/null 2>&1"
-
-# Thêm cronjob cho site mới
-grep -q "$SITE_NAME" /etc/crontab || echo "$CRON_JOB" >> /etc/crontab
-
-# Triển khai lần đầu
-log "Triển khai lần đầu cho $SITE_NAME..."
-$AUTODEPLOY_ROOT/scripts/deploy.sh "$SITE_NAME"
-
-# Hoàn tất
-log "Đã thêm site $SITE_NAME thành công!"
-echo ""
-echo "Thông tin trang web:"
-echo "- Tên site: $SITE_NAME"
-echo "- Tên miền: $DOMAIN"
-echo "- Repository: $GIT_URL (nhánh $BRANCH)"
-echo "- Loại: $TYPE"
-echo "- Cổng: $PORT"
-echo ""
-echo "Thông tin database PostgreSQL:"
-echo "- Lưu trong file: $AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env"
-cat "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env"
-echo ""
-echo "Thông tin email SMTP:"
-echo "- Lưu trong file: $AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env"
-cat "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env"
-echo ""
-echo "Hướng dẫn cập nhật ứng dụng:"
-echo "1. Push code lên repository gốc. Hệ thống sẽ tự động kiểm tra mỗi 5 giây và triển khai khi có cập nhật mới."
-echo "2. Hoặc thêm webhook từ GitHub/GitLab tới: (đang phát triển)"
-echo ""
-echo "Để xem log triển khai: tail -f $AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
-EOL
-
-# Tạo script deploy.sh
-cat > $AUTODEPLOY_ROOT/scripts/deploy.sh << 'EOL'
-#!/bin/bash
-
-# Script triển khai cho một trang web
-# Sử dụng: ./deploy.sh <site_name>
-
-# Kiểm tra tham số
-if [ $# -lt 1 ]; then
-    echo "Sử dụng: $0 <site_name>"
-    exit 1
-fi
-
-# Nạp các hàm tiện ích
-source "/opt/autodeploy/scripts/utils.sh"
-
-SITE_NAME=$1
-CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
-LOG_FILE="$AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
-WWW_DIR="$AUTODEPLOY_ROOT/www/$SITE_NAME"
-REPO_DIR="$AUTODEPLOY_ROOT/repos/$SITE_NAME.git"
-TEMP_DIR=$(mktemp -d)
-
-# Đảm bảo log file tồn tại
-touch "$LOG_FILE"
-
-# Hàm ghi log đặc biệt cho quá trình triển khai
-deploy_log() {
-    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
-
-# Xử lý khi có lỗi
-handle_error() {
-    deploy_log "LỖI: $1"
-    
-    # Gửi email thông báo lỗi
-    if [ -f "$AUTODEPLOY_ROOT/config/global.json" ]; then
-        ADMIN_EMAIL=$(grep -o '"adminEmail": "[^"]*"' "$AUTODEPLOY_ROOT/config/global.json" | cut -d'"' -f4)
-        if [ -n "$ADMIN_EMAIL" ]; then
-            echo "Lỗi triển khai $SITE_NAME: $1" | mail -s "[AUTODEPLOY ERROR] Lỗi triển khai $SITE_NAME" "$ADMIN_EMAIL"
-        fi
-    fi
-    
-    rm -rf "$TEMP_DIR"
-    exit 1
-}
-
-# Kiểm tra xem cấu hình có tồn tại không
-if [ ! -f "$CONFIG_FILE" ]; then
-    handle_error "Không tìm thấy cấu hình cho site $SITE_NAME"
-fi
-
-# Đọc cấu hình
-DOMAIN=$(grep -o '"domain": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-GIT_URL=$(grep -o '"gitUrl": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-TYPE=$(grep -o '"type": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-PORT=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}')
-BRANCH=$(grep -o '"branch": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-BUILD_CMD=$(grep -o '"buildCommand": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-START_CMD=$(grep -o '"startCommand": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-
-deploy_log "Bắt đầu triển khai $SITE_NAME (Domain: $DOMAIN, Loại: $TYPE, Nhánh: $BRANCH)"
-
-# Clone repository vào thư mục tạm
-deploy_log "Clone repository vào thư mục tạm..."
-git clone "$REPO_DIR" "$TEMP_DIR" 2>> "$LOG_FILE" || handle_error "Không thể clone repository"
-
-# Chuyển đến thư mục tạm và checkout nhánh yêu cầu
-cd "$TEMP_DIR" || handle_error "Không thể chuyển đến thư mục tạm"
-git checkout "$BRANCH" 2>> "$LOG_FILE" || handle_error "Không thể checkout nhánh $BRANCH"
-
-# Lấy commit hash hiện tại
-CURRENT_COMMIT=$(git rev-parse HEAD)
-deploy_log "Commit hiện tại: $CURRENT_COMMIT"
-
-# Cập nhật commit hash trong cấu hình
-sed -i "s/\"lastCommit\": .*,/\"lastCommit\": \"$CURRENT_COMMIT\",/" "$CONFIG_FILE"
-
-# Sao chép các file cấu hình database và email vào thư mục tạm
-if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" ]; then
-    deploy_log "Sao chép cấu hình database..."
-    cp "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" "$TEMP_DIR/.env.db"
-fi
-
-if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env" ]; then
-    deploy_log "Sao chép cấu hình email..."
-    cp "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env" "$TEMP_DIR/.env.email"
-fi
-
-# Tạo hoặc cập nhật file .env
-deploy_log "Tạo file .env..."
-cat > "$TEMP_DIR/.env" << EOF
-# Tự động tạo bởi hệ thống auto-deploy
-NODE_ENV=production
-PORT=$PORT
-EOF
-
-# Thêm cấu hình database và email vào .env
-if [ -f "$TEMP_DIR/.env.db" ]; then
-    cat "$TEMP_DIR/.env.db" >> "$TEMP_DIR/.env"
-fi
-
-if [ -f "$TEMP_DIR/.env.email" ]; then
-    cat "$TEMP_DIR/.env.email" >> "$TEMP_DIR/.env"
-fi
-
-# Cài đặt dependencies nếu có package.json
-if [ -f "$TEMP_DIR/package.json" ]; then
-    deploy_log "Cài đặt dependencies..."
-    cd "$TEMP_DIR" && npm install --production 2>> "$LOG_FILE" || handle_error "Không thể cài đặt dependencies"
-    
-    # Chạy lệnh build nếu cần
-    if [[ "$TYPE" != "node" && -n "$BUILD_CMD" ]]; then
-        deploy_log "Chạy lệnh build: $BUILD_CMD"
-        cd "$TEMP_DIR" && eval "$BUILD_CMD" 2>> "$LOG_FILE" || handle_error "Không thể build dự án"
-    fi
-fi
-
-# Xác định thư mục chứa mã nguồn cuối cùng
-if [[ "$TYPE" == "static" || "$TYPE" == "spa" ]]; then
-    # Kiểm tra xem build output có thể nằm trong thư mục build hay dist
-    if [ -d "$TEMP_DIR/build" ]; then
-        FINAL_DIR="$TEMP_DIR/build"
-    elif [ -d "$TEMP_DIR/dist" ]; then
-        FINAL_DIR="$TEMP_DIR/dist"
-    else
-        FINAL_DIR="$TEMP_DIR"
-    fi
-else
-    FINAL_DIR="$TEMP_DIR"
-fi
-
-# Đảm bảo thư mục www tồn tại
-mkdir -p "$WWW_DIR"
-
-# Triển khai mã nguồn
-deploy_log "Triển khai mã nguồn đến $WWW_DIR..."
-if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
-    # Đối với ứng dụng Node.js, sao chép toàn bộ mã nguồn
-    rsync -a --delete --exclude='.git' "$TEMP_DIR/" "$WWW_DIR/" 2>> "$LOG_FILE" || handle_error "Không thể sao chép mã nguồn"
-else
-    # Đối với static/spa, chỉ sao chép nội dung build
-    rsync -a --delete "$FINAL_DIR/" "$WWW_DIR/" 2>> "$LOG_FILE" || handle_error "Không thể sao chép mã nguồn"
-fi
-
-# Thiết lập quyền
-deploy_log "Thiết lập quyền..."
-chown -R www-data:www-data "$WWW_DIR" 2>> "$LOG_FILE" || deploy_log "Cảnh báo: Không thể thiết lập quyền cho thư mục $WWW_DIR"
-
-# Xử lý ứng dụng Node.js với PM2
-if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
-    deploy_log "Quản lý ứng dụng Node.js với PM2..."
-    
-    # Kiểm tra xem ứng dụng đã được khởi tạo trong PM2 chưa
-    if pm2 list | grep -q "$SITE_NAME"; then
-        # Nếu đã tồn tại, restart ứng dụng
-        deploy_log "Khởi động lại ứng dụng trong PM2..."
-        cd "$WWW_DIR" && pm2 restart "$SITE_NAME" 2>> "$LOG_FILE" || handle_error "Không thể khởi động lại ứng dụng"
-    else
-        # Nếu chưa tồn tại, thêm ứng dụng mới vào PM2
-        deploy_log "Thêm ứng dụng vào PM2..."
-        
-        # Xác định entry point
-        if [ -f "$WWW_DIR/ecosystem.config.js" ]; then
-            # Sử dụng ecosystem.config.js nếu có
-            cd "$WWW_DIR" && pm2 start ecosystem.config.js 2>> "$LOG_FILE" || handle_error "Không thể khởi động ứng dụng với ecosystem.config.js"
-        elif [ -f "$WWW_DIR/package.json" ]; then
-            # Tìm entry point từ package.json
-            if grep -q '"main"' "$WWW_DIR/package.json"; then
-                ENTRY_POINT=$(grep -o '"main": "[^"]*"' "$WWW_DIR/package.json" | cut -d'"' -f4)
-                cd "$WWW_DIR" && pm2 start "$ENTRY_POINT" --name "$SITE_NAME" --env production 2>> "$LOG_FILE" || handle_error "Không thể khởi động ứng dụng với entry point từ package.json"
-            else
-                # Sử dụng start command đã cấu hình
-                cd "$WWW_DIR" && pm2 start --name "$SITE_NAME" --env production npm -- start 2>> "$LOG_FILE" || handle_error "Không thể khởi động ứng dụng với start command"
-            fi
-        else
-            handle_error "Không thể xác định cách khởi động ứng dụng Node.js"
-        fi
-    fi
-    
-    # Lưu cấu hình PM2
-    deploy_log "Lưu cấu hình PM2..."
-    pm2 save 2>> "$LOG_FILE" || deploy_log "Cảnh báo: Không thể lưu cấu hình PM2"
-}
-
-# Cập nhật thời gian triển khai cuối cùng trong cấu hình
-sed -i "s/\"lastDeploy\": .*,/\"lastDeploy\": \"$(date '+%Y-%m-%d %H:%M:%S')\",/" "$CONFIG_FILE"
-
-# Dọn dẹp
-deploy_log "Dọn dẹp..."
-rm -rf "$TEMP_DIR"
-
-deploy_log "Triển khai $SITE_NAME thành công!"
-EOL
-
-# Tạo script check-updates.sh
-cat > $AUTODEPLOY_ROOT/scripts/check-updates.sh << 'EOL'
-#!/bin/bash
-
-# Script kiểm tra cập nhật Git tự động
-# Sử dụng: ./check-updates.sh <site_name>
-
-# Kiểm tra tham số
-if [ $# -lt 1 ]; then
-    echo "Sử dụng: $0 <site_name>"
-    exit 1
-fi
-
-# Nạp các hàm tiện ích
-source "/opt/autodeploy/scripts/utils.sh"
-
-SITE_NAME=$1
-CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
-
-# Kiểm tra xem cấu hình có tồn tại không
-if [ ! -f "$CONFIG_FILE" ]; then
-    error "Không tìm thấy cấu hình cho site $SITE_NAME"
-    exit 1
-fi
-
-# Đọc cấu hình
-GIT_URL=$(grep -o '"gitUrl": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-BRANCH=$(grep -o '"branch": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-
-# Kiểm tra cập nhật
-if check_git_update "$SITE_NAME" "$GIT_URL" "$BRANCH"; then
-    log "Phát hiện cập nhật mới cho $SITE_NAME. Đang triển khai..."
-    
-    # Thực hiện triển khai
-    $AUTODEPLOY_ROOT/scripts/deploy.sh "$SITE_NAME"
-fi
-
-exit 0
-EOL
-
-# Tạo script remove-site.sh
-cat > $AUTODEPLOY_ROOT/scripts/remove-site.sh << 'EOL'
-#!/bin/bash
-
-# Script xóa một trang web khỏi hệ thống auto-deploy
-# Sử dụng: ./remove-site.sh <site_name> [--force]
-
-# Đảm bảo script chạy với quyền root
-if [[ $EUID -ne 0 ]]; then
-   echo "Script này phải được chạy với quyền root" 
-   exit 1
-fi
-
-# Nạp các hàm tiện ích
-source "/opt/autodeploy/scripts/utils.sh"
-
-# Kiểm tra tham số
-if [ $# -lt 1 ]; then
-    echo "Sử dụng: $0 <site_name> [--force]"
-    exit 1
-fi
-
-SITE_NAME=$1
-FORCE=0
-
-if [ "$2" == "--force" ]; then
-    FORCE=1
-fi
-
-# Kiểm tra xem site có tồn tại không
-if ! site_exists "$SITE_NAME"; then
-    error "Site $SITE_NAME không tồn tại trong hệ thống"
-    exit 1
-fi
-
-# Đọc cấu hình site
-CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
-DOMAIN=$(grep -o '"domain": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-TYPE=$(grep -o '"type": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-
-# Xác nhận xóa nếu không có tham số --force
-if [ $FORCE -eq 0 ]; then
-    read -p "Bạn có chắc chắn muốn xóa site $SITE_NAME ($DOMAIN)? Điều này sẽ xóa tất cả dữ liệu liên quan. (y/n): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        log "Hủy thao tác xóa"
-        exit 0
-    fi
-fi
-
-# Dừng ứng dụng Node.js nếu có
-if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
-    if pm2 list | grep -q "$SITE_NAME"; then
-        log "Dừng ứng dụng Node.js..."
-        pm2 delete "$SITE_NAME" && pm2 save
-    fi
-fi
-
-# Đọc thông tin database
-if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" ]; then
-    DB_USER=$(grep "DB_USER=" "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" | cut -d'=' -f2)
-    DB_NAME=$(grep "DB_NAME=" "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" | cut -d'=' -f2)
-    
-    # Xóa database và user
-    log "Xóa database PostgreSQL..."
-    sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" > /dev/null 2>&1
-    sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" > /dev/null 2>&1
-fi
-
-# Xóa cấu hình Nginx và SSL
-log "Xóa cấu hình Nginx và SSL..."
-if [ -f "/etc/nginx/conf.d/$DOMAIN.conf" ]; then
-    rm "/etc/nginx/conf.d/$DOMAIN.conf"
-    
-    # Xóa cấu hình SSL
-    if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-        certbot delete --cert-name "$DOMAIN" --non-interactive
-    fi
-    
-    systemctl reload nginx
-fi
-
-# Xóa cron job
-log "Xóa cron job..."
-sed -i "/$SITE_NAME/d" /etc/crontab
-
-# Xóa các thư mục và file liên quan
-log "Xóa mã nguồn và cấu hình..."
-rm -rf "$AUTODEPLOY_ROOT/www/$SITE_NAME"
-rm -rf "$AUTODEPLOY_ROOT/repos/$SITE_NAME.git"
-rm -f "$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
-rm -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env"
-rm -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_email.env"
-rm -f "$AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
-rm -rf "$AUTODEPLOY_ROOT/logs/nginx/$SITE_NAME"
-
-log "Đã xóa site $SITE_NAME thành công!"
-EOL
-
-# Tạo script list-sites.sh
-cat > $AUTODEPLOY_ROOT/scripts/list-sites.sh << 'EOL'
-#!/bin/bash
-
-# Script liệt kê các trang web trong hệ thống auto-deploy
-# Sử dụng: ./list-sites.sh [--format json]
-
-# Nạp các hàm tiện ích
-source "/opt/autodeploy/scripts/utils.sh"
-
-# Kiểm tra định dạng output
-FORMAT="table"
-if [ "$1" == "--format" ] && [ "$2" == "json" ]; then
-    FORMAT="json"
-fi
-
-# Đếm số lượng sites
-SITES_COUNT=$(ls -1 $AUTODEPLOY_ROOT/config/sites/*.json 2>/dev/null | grep -v "_db.env\|_email.env" | wc -l)
-
-if [ $SITES_COUNT -eq 0 ]; then
-    if [ "$FORMAT" == "json" ]; then
-        echo "[]"
-    else
-        echo "Không có trang web nào trong hệ thống."
-    fi
-    exit 0
-fi
-
-# Hiển thị thông tin theo định dạng JSON
-if [ "$FORMAT" == "json" ]; then
-    echo "["
-    COUNTER=0
-    for config_file in $AUTODEPLOY_ROOT/config/sites/*.json; do
-        # Bỏ qua các file cấu hình database và email
-        if [[ "$config_file" != *"_db.env"* && "$config_file" != *"_email.env"* ]]; then
-            COUNTER=$((COUNTER+1))
-            cat "$config_file"
-            if [ $COUNTER -lt $SITES_COUNT ]; then
-                echo ","
-            fi
-        fi
-    done
-    echo "]"
-else
-    # Hiển thị thông tin dạng bảng
-    printf "%-20s %-30s %-15s %-10s %-15s %-25s\n" "SITE NAME" "DOMAIN" "TYPE" "PORT" "BRANCH" "LAST DEPLOY"
-    printf "%-20s %-30s %-15s %-10s %-15s %-25s\n" "--------------------" "------------------------------" "---------------" "----------" "---------------" "-------------------------"
-    
-    for config_file in $AUTODEPLOY_ROOT/config/sites/*.json; do
-        # Bỏ qua các file cấu hình database và email
-        if [[ "$config_file" != *"_db.env"* && "$config_file" != *"_email.env"* ]]; then
-            SITE_NAME=$(grep -o '"siteName": "[^"]*"' "$config_file" | cut -d'"' -f4)
-            DOMAIN=$(grep -o '"domain": "[^"]*"' "$config_file" | cut -d'"' -f4)
-            TYPE=$(grep -o '"type": "[^"]*"' "$config_file" | cut -d'"' -f4)
-            PORT=$(grep -o '"port": [0-9]*' "$config_file" | awk '{print $2}')
-            BRANCH=$(grep -o '"branch": "[^"]*"' "$config_file" | cut -d'"' -f4)
-            LAST_DEPLOY=$(grep -o '"lastDeploy": "[^"]*"' "$config_file" | cut -d'"' -f4)
-            
-            if [ "$LAST_DEPLOY" == "null" ]; then
-                LAST_DEPLOY="Chưa triển khai"
-            fi
-            
-            printf "%-20s %-30s %-15s %-10s %-15s %-25s\n" "$SITE_NAME" "$DOMAIN" "$TYPE" "$PORT" "$BRANCH" "$LAST_DEPLOY"
-        fi
-    done
-fi
-EOL
-
-# Tạo script debug.sh
-cat > $AUTODEPLOY_ROOT/scripts/debug.sh << 'EOL'
-#!/bin/bash
-
-# Script hiển thị thông tin debug
-# Sử dụng: ./debug.sh <site_name>
-
-# Nạp các hàm tiện ích
-source "/opt/autodeploy/scripts/utils.sh"
-
-# Kiểm tra tham số
-if [ $# -lt 1 ]; then
-    echo "Sử dụng: $0 <site_name>"
-    exit 1
-fi
-
-SITE_NAME=$1
-CONFIG_FILE="$AUTODEPLOY_ROOT/config/sites/$SITE_NAME.json"
-
-# Kiểm tra xem site có tồn tại không
-if ! site_exists "$SITE_NAME"; then
-    error "Site $SITE_NAME không tồn tại trong hệ thống"
-    exit 1
-fi
-
-# Đọc cấu hình site
-DOMAIN=$(grep -o '"domain": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-GIT_URL=$(grep -o '"gitUrl": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-TYPE=$(grep -o '"type": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-PORT=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}')
-BRANCH=$(grep -o '"branch": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-LAST_DEPLOY=$(grep -o '"lastDeploy": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-LAST_CHECK=$(grep -o '"lastCheck": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-LAST_COMMIT=$(grep -o '"lastCommit": "[^"]*"' "$CONFIG_FILE" | cut -d'"' -f4)
-
-echo "=== THÔNG TIN DEBUG CHO $SITE_NAME ==="
-echo ""
-echo "Thông tin cơ bản:"
-echo "- Tên site: $SITE_NAME"
-echo "- Tên miền: $DOMAIN"
-echo "- Repository: $GIT_URL (nhánh $BRANCH)"
-echo "- Loại: $TYPE"
-echo "- Cổng: $PORT"
-echo "- Triển khai cuối: $LAST_DEPLOY"
-echo "- Kiểm tra cuối: $LAST_CHECK"
-echo "- Commit cuối: $LAST_COMMIT"
-echo ""
-
-echo "Kiểm tra dịch vụ:"
-echo "- Nginx:"
-if systemctl is-active --quiet nginx; then
-    echo "  + Trạng thái: Đang chạy"
-else
-    echo "  + Trạng thái: KHÔNG CHẠY"
-fi
-
-echo "  + Cấu hình site:"
-if [ -f "/etc/nginx/conf.d/$DOMAIN.conf" ]; then
-    echo "    * Đã tìm thấy cấu hình"
-    nginx -t
-else
-    echo "    * KHÔNG TÌM THẤY cấu hình"
-fi
-
-echo "- SSL:"
-if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-    echo "  + Đã cài đặt SSL"
-    certbot certificates -d "$DOMAIN"
-else
-    echo "  + CHƯA cài đặt SSL"
-fi
-
-echo "- PostgreSQL:"
-if [ -f "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" ]; then
-    DB_NAME=$(grep "DB_NAME=" "$AUTODEPLOY_ROOT/config/sites/${SITE_NAME}_db.env" | cut -d'=' -f2)
-    echo "  + Database: $DB_NAME"
-    # Kiểm tra xem database có tồn tại không
-    if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
-        echo "  + Trạng thái: Database tồn tại"
-    else
-        echo "  + Trạng thái: DATABASE KHÔNG TỒN TẠI"
-    fi
-else
-    echo "  + KHÔNG TÌM THẤY cấu hình database"
-fi
-
-echo "- Node.js PM2:"
-if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
-    if pm2 list | grep -q "$SITE_NAME"; then
-        echo "  + Trạng thái: Đang chạy"
-        pm2 show "$SITE_NAME"
-    else
-        echo "  + Trạng thái: KHÔNG CHẠY"
-    fi
-else
-    echo "  + Không áp dụng cho loại site này"
-fi
-
-echo ""
-echo "Các đường dẫn quan trọng:"
-echo "- Thư mục mã nguồn: $AUTODEPLOY_ROOT/www/$SITE_NAME"
-echo "- Repository Git: $AUTODEPLOY_ROOT/repos/$SITE_NAME.git"
-echo "- File cấu hình: $CONFIG_FILE"
-echo "- File log triển khai: $AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
-echo "- File log Nginx: $AUTODEPLOY_ROOT/logs/nginx/$SITE_NAME/access.log và error.log"
-
-echo ""
-echo "10 dòng log triển khai gần đây nhất:"
-tail -n 10 "$AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log" 2>/dev/null || echo "Không tìm thấy file log"
-
-echo ""
-echo "Kiểm tra kết nối:"
-if ping -c 1 "$DOMAIN" &> /dev/null; then
-    echo "- Có thể ping tới $DOMAIN"
-else
-    echo "- KHÔNG THỂ ping tới $DOMAIN"
-fi
-
-if curl -s --head "http://$DOMAIN" &> /dev/null; then
-    echo "- HTTP (80) có thể kết nối"
-else
-    echo "- HTTP (80) KHÔNG THỂ kết nối"
-fi
-
-if curl -s --head "https://$DOMAIN" &> /dev/null; then
-    echo "- HTTPS (443) có thể kết nối"
-else
-    echo "- HTTPS (443) KHÔNG THỂ kết nối"
-fi
-
-if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
-    if curl -s "http://localhost:$PORT" &> /dev/null; then
-        echo "- Cổng $PORT có thể kết nối (Node.js)"
-    else
-        echo "- Cổng $PORT KHÔNG THỂ kết nối (Node.js)"
-    fi
-fi
-
-echo ""
-echo "Các lệnh hữu ích:"
-echo "- Triển khai lại: $AUTODEPLOY_ROOT/scripts/deploy.sh $SITE_NAME"
-echo "- Xem log triển khai: tail -f $AUTODEPLOY_ROOT/logs/deploy/$SITE_NAME.log"
-echo "- Xem log Nginx: tail -f $AUTODEPLOY_ROOT/logs/nginx/$SITE_NAME/error.log"
-if [[ "$TYPE" == "node" || "$TYPE" == "fullstack" ]]; then
-    echo "- Xem log PM2: pm2 logs $SITE_NAME"
-    echo "- Restart ứng dụng: pm2 restart $SITE_NAME"
-fi
-EOL
-
-# Thiết lập quyền thực thi cho các script
-chmod +x $AUTODEPLOY_ROOT/scripts/*.sh
-
-# Tạo cấu hình toàn cục
-cat > $AUTODEPLOY_ROOT/config/global.json << EOL
-{
-    "version": "1.0.0",
-    "setupDate": "$(date '+%Y-%m-%d %H:%M:%S')",
-    "serverName": "$(hostname)",
-    "mainDomain": "$MAIN_DOMAIN",
-    "useHttps": true,
-    "defaultBranch": "main",
-    "adminEmail": "admin@$MAIN_DOMAIN",
-    "checkInterval": 5
-}
-EOL
-
-# Tạo cron job mẫu cho check-updates.sh
-cat > /etc/cron.d/autodeploy << 'EOL'
-# Cron job cho hệ thống auto-deploy
-# Kiểm tra cập nhật mỗi phút cho tất cả các site
-
-*/1 * * * * root find /opt/autodeploy/config/sites -name "*.json" -not -path "*_db.env*" -not -path "*_email.env*" -exec basename {} \; | sed 's/\.json$//' | xargs -I{} /opt/autodeploy/scripts/check-updates.sh {} >/dev/null 2>&1
-EOL
-
-chmod 644 /etc/cron.d/autodeploy
-
-# Tạo tệp init.d để khởi động lại PM2 khi khởi động
-log "Cấu hình PM2 để tự khởi động khi server khởi động..."
-env PATH=$PATH:/usr/bin pm2 startup -u root --hp /root
-pm2 save
-
-# Hiển thị hướng dẫn sử dụng
-log "Thiết lập server hoàn tất!"
-echo ""
-echo "Hệ thống auto-deploy cho $MAIN_DOMAIN đã được cài đặt thành công!"
-echo ""
-echo "CẤU HÌNH DNS QUAN TRỌNG:"
-echo "Đảm bảo bạn đã cấu hình DNS wildcard cho $MAIN_DOMAIN:"
-echo "- Bản ghi A: $MAIN_DOMAIN -> $SERVER_IP"
-echo "- Bản ghi A: *.$MAIN_DOMAIN -> $SERVER_IP"
-echo ""
-echo "Để quản lý các trang web:"
-echo "1. Thêm trang web mới:"
-echo "   $AUTODEPLOY_ROOT/scripts/add-site.sh myapp https://github.com/username/repo.git --type fullstack"
-echo ""
-echo "2. Xóa trang web:"
-echo "   $AUTODEPLOY_ROOT/scripts/remove-site.sh myapp"
-echo ""
-echo "3. Liệt kê các trang web:"
-echo "   $AUTODEPLOY_ROOT/scripts/list-sites.sh"
-echo ""
-echo "4. Debug trang web:"
-echo "   $AUTODEPLOY_ROOT/scripts/debug.sh myapp"
-echo ""
-echo "Hệ thống sẽ tự động kiểm tra cập nhật từ GitHub mỗi 5 giây và triển khai khi có cập nhật mới."
-echo "Tất cả các trang web sẽ tự động được cấu hình với SSL Let's Encrypt."
-echo ""
-echo "Mỗi trang web sẽ có:"
-echo "- Subdomain tự động tạo: <site_name>.$MAIN_DOMAIN"
-echo "- Database PostgreSQL"
-echo "- Tài khoản email SMTP"
-echo "- File .env với các thông tin cấu hình"
-echo ""
-echo "Thư mục các script: $AUTODEPLOY_ROOT/scripts/"
-echo "Thư mục cấu hình: $AUTODEPLOY_ROOT/config/"
-echo "Thư mục mã nguồn: $AUTODEPLOY_ROOT/www/"
-echo "Thư mục repository Git: $AUTODEPLOY_ROOT/repos/"
-echo "Thư mục log: $AUTODEPLOY_ROOT/logs/"
+    # Ch
