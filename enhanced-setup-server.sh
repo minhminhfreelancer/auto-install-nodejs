@@ -193,65 +193,7 @@ check_services_availability() {
     return 0
 }
 
-# Chuyển đến thư mục và checkout nhánh
-    cd "$temp_dir" || return 1
-    git checkout "$branch" &> /dev/null
-    
-    # Lấy commit hash mới nhất
-    local latest_commit=$(git rev-parse HEAD)
-    
-    # Lấy commit hash cuối cùng đã deploy
-    local last_commit=$(grep -o '"lastCommit": "[^"]*"' "$config_file" | cut -d'"' -f4)
-    
-    # Nếu chưa có commit hash trong cấu hình hoặc commit hash đã thay đổi
-    if [ "$last_commit" = "null" ] || [ "$latest_commit" != "$last_commit" ]; then
-        # Cập nhật commit hash mới nhất
-        sed -i "s/\"lastCommit\": .*,/\"lastCommit\": \"$latest_commit\",/" "$config_file"
-        
-        # Dọn dẹp
-        rm -rf "$temp_dir"
-        
-        # Có cập nhật mới
-        return 0
-    else
-        # Dọn dẹp
-        rm -rf "$temp_dir"
-        
-        # Không có cập nhật mới
-        return 1
-    fi
-}
-
-# Hàm clone repo từ Git URL
-clone_repository() {
-    local site_name=$1
-    local git_url=$2
-    local branch=$3
-    local repo_dir="$AUTODEPLOY_ROOT/repos/$site_name.git"
-    
-    log "Clone repository từ $git_url cho $site_name..."
-    
-    # Xóa repo cũ nếu có
-    if [ -d "$repo_dir" ]; then
-        rm -rf "$repo_dir"
-    fi
-    
-    # Tạo thư mục cho repo
-    mkdir -p "$repo_dir"
-    
-    # Clone bare repository
-    git clone --mirror "$git_url" "$repo_dir"
-    
-    if [ $? -ne 0 ]; then
-        error "Không thể clone repository từ $git_url"
-        return 1
-    fi
-    
-    # Tạo hook post-receive
-    generate_post_receive_hook "$site_name"
-    
-    return 0
-}ạy cài đặt dependencies
+# Chạy cài đặt dependencies
 install_dependencies
 
 # Kiểm tra các dịch vụ sau khi cài đặt
@@ -1216,8 +1158,8 @@ is_valid_domain() {
 
 # Hàm kiểm tra tên site có hợp lệ không
 is_valid_site_name() {
-    local name=$1
-    if [[ $name =~ ^[a-zA-Z0-9][a-zA-Z0-9\-]*$ ]]; then
+    local site_name=$1
+    if [[ $site_name =~ ^[a-zA-Z0-9][a-zA-Z0-9\-]*$ ]]; then
         return 0
     else
         return 1
@@ -1579,4 +1521,61 @@ check_git_update() {
         return 1
     fi
     
-    # Ch
+    # Chuyển đến thư mục và checkout nhánh
+    cd "$temp_dir" || return 1
+    git checkout "$branch" &> /dev/null
+    
+    # Lấy commit hash mới nhất
+    local latest_commit=$(git rev-parse HEAD)
+    
+    # Lấy commit hash cuối cùng đã deploy
+    local last_commit=$(grep -o '"lastCommit": "[^"]*"' "$config_file" | cut -d'"' -f4)
+    
+    # Nếu chưa có commit hash trong cấu hình hoặc commit hash đã thay đổi
+    if [ "$last_commit" = "null" ] || [ "$latest_commit" != "$last_commit" ]; then
+        # Cập nhật commit hash mới nhất
+        sed -i "s/\"lastCommit\": .*,/\"lastCommit\": \"$latest_commit\",/" "$config_file"
+        
+        # Dọn dẹp
+        rm -rf "$temp_dir"
+        
+        # Có cập nhật mới
+        return 0
+    else
+        # Dọn dẹp
+        rm -rf "$temp_dir"
+        
+        # Không có cập nhật mới
+        return 1
+    fi
+}
+
+# Hàm clone repo từ Git URL
+clone_repository() {
+    local site_name=$1
+    local git_url=$2
+    local branch=$3
+    local repo_dir="$AUTODEPLOY_ROOT/repos/$site_name.git"
+    
+    log "Clone repository từ $git_url cho $site_name..."
+    
+    # Xóa repo cũ nếu có
+    if [ -d "$repo_dir" ]; then
+        rm -rf "$repo_dir"
+    fi
+    
+    # Tạo thư mục cho repo
+    mkdir -p "$repo_dir"
+    
+    # Clone bare repository
+    git clone --mirror "$git_url" "$repo_dir"
+    
+    if [ $? -ne 0 ]; then
+        error "Không thể clone repository từ $git_url"
+        return 1
+    fi
+    
+    # Tạo hook post-receive
+    generate_post_receive_hook "$site_name"
+    
+    return 0
